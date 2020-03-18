@@ -198,6 +198,18 @@ typedef struct ndpi_id {
 u_int32_t current_ndpi_memory = 0, max_ndpi_memory = 0;
 #ifdef USE_DPDK
 static int dpdk_port_id = 0, dpdk_run_capture = 1;
+
+/* =========modified by Hao Li================== */
+static int proc_id = -1;
+static unsigned num_procs = 0;
+
+static uint16_t ports[RTE_MAX_ETHPORTS];
+static unsigned num_ports = 0;
+
+static struct lcore_ports lcore_ports[RTE_MAX_LCORE];
+int smp_parse_args(int argc, char **argv);
+/* =========modified by Hao Li================== */
+
 #endif
 
 void test_lib(); /* Forward */
@@ -642,7 +654,11 @@ static void parseOptions(int argc, char **argv) {
       rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
 
     argc -= ret, argv += ret;
+    ret = smp_parse_args(argc, argv);
+    argc -= ret, argv += ret;
   }
+
+  
 #endif
 
   while((opt = getopt_long(argc, argv, "e:c:C:df:g:i:hp:P:l:s:tv:V:n:Jrp:w:q0123:456:7:89:m:T:U:",
@@ -828,8 +844,10 @@ static void parseOptions(int argc, char **argv) {
     }
   }
 
+#ifndef USE_DPDK
   if(_pcap_file[0] == NULL)
     help(0);
+#endif
 
   if(csv_fp)
     printCSVHeader();
@@ -2680,6 +2698,100 @@ static void configurePcapHandle(pcap_t * pcap_handle) {
   }
 }
 
+/* =========modified by Hao Li================== */
+int smp_parse_args(int argc, char **argv)
+{
+	int opt, ret;
+	char **argvopt;
+	int option_index;
+	uint16_t i, port_mask = 0;
+	char *prgname = argv[0];
+	static struct option lgopts[] = {
+			{PARAM_NUM_PROCS, 1, 0, 0},
+			{PARAM_PROC_ID, 1, 0, 0},
+			{NULL, 0, 0, 0}
+	};
+
+	argvopt = argv;
+
+	while ((opt = getopt_long(argc, argvopt, "p:", \
+			lgopts, &option_index)) != EOF) {
+
+		switch (opt) {
+		case 'p':
+			port_mask = strtoull(optarg, NULL, 16);
+			break;
+			/* long options */
+		case 0:
+			if (strncmp(lgopts[option_index].name, PARAM_NUM_PROCS, 8) == 0)
+				num_procs = atoi(optarg);
+			else if (strncmp(lgopts[option_index].name, PARAM_PROC_ID, 7) == 0)
+				proc_id = atoi(optarg);
+			break;
+
+		default:
+      printf("Cannot parse all command-line arguments\n");
+			// smp_usage(prgname, "Cannot parse all command-line arguments\n");
+		}
+	}
+
+	if (optind >= 0)
+		argv[optind-1] = prgname;
+
+	if (proc_id < 0)
+		// smp_usage(prgname, "Invalid or missing proc-id parameter\n");
+		printf("Invalid or missing proc-id parameter\n");
+	if (rte_eal_process_type() == RTE_PROC_PRIMARY && num_procs == 0)
+		// smp_usage(prgname, "Invalid or missing num-procs parameter\n");
+		printf("Invalid or missing num-procs parameter\n");
+	if (port_mask == 0)
+		// smp_usage(prgname, "Invalid or missing port mask\n");
+    printf("Invalid or missing port mask\n");
+
+	/* get the port numbers from the port mask */
+	RTE_ETH_FOREACH_DEV(i)
+		if(port_mask & (1 << i))
+			ports[num_ports++] = (uint8_t)i;
+
+	ret = optind-1;
+	optind = 1; /* reset getopt lib */
+
+	return ret;
+}
+
+static void 
+assign_all_ports_to_all_cores(void)
+{
+  unsigned i;
+  const unsigned lcores = rte_eal_get_configuration()->lcore_count;
+  RTE_LCORE_FOREACH(i) {
+    lcore_ports[i].start_port = 0;
+    lcore_ports[i].num_ports = num_ports;
+  }
+}
+
+static void
+assign_ports_to_cores(void)
+{
+
+  const unsigned lcores = rte_eal_get_configuration()->lcore_count;
+  const unsigned port_pairs = num_ports / 2;
+  const unsigned pairs_per_lcore = port_pairs / lcores;
+  unsigned extra_pairs = port_pairs % lcores;
+  unsigned ports_assigned = 0;
+  unsigned i;
+
+  RTE_LCORE_FOREACH(i) {
+    lcore_ports[i].start_port = ports_assigned;
+    lcore_ports[i].num_ports = pairs_per_lcore * 2;
+    if (extra_pairs > 0) {
+      lcore_ports[i].num_ports += 2;
+      extra_pairs--;
+    }
+    ports_assigned += lcore_ports[i].num_ports;
+  }
+}
+/* =========modified by Hao Li================== */
 
 /**
  * @brief Open a pcap file or a specified device - Always returns a valid pcap_t
@@ -2692,16 +2804,57 @@ static pcap_t * openPcapFileOrDevice(u_int16_t thread_id, const u_char * pcap_fi
 
   /* trying to open a live interface */
 #ifdef USE_DPDK
-  struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS,
-							  MBUF_CACHE_SIZE, 0,
-							  RTE_MBUF_DEFAULT_BUF_SIZE,
-							  rte_socket_id());
+/* =========modified by Hao Li================== */
+  static const char *_SMP_MBUF_POOL = "SMP_MBUF_POOL";
+  int ret;
+  unsigned i;
+  enum rte_proc_type_t proc_type;
+  struct rte_mempool *mp;
 
-  if(mbuf_pool == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool: are hugepages ok?\n");
+  printf("Creating memory pool\n");
+  proc_type = rte_eal_process_type();
+  mp = (proc_type == RTE_PROC_SECONDARY) ?
+      rte_mempool_lookup(_SMP_MBUF_POOL) :
+      rte_pktmbuf_pool_create(_SMP_MBUF_POOL, NUM_MBUFS,
+        MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+        rte_socket_id());
+  if (mp == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot get memory pool for buffers\n");
 
-  if(dpdk_port_init(dpdk_port_id, mbuf_pool) != 0)
-    rte_exit(EXIT_FAILURE, "DPDK: Cannot init port %u: please see README.dpdk\n", dpdk_port_id);
+  printf("Configuring ports\n");
+  // if (num_ports & 1)
+  //   rte_exit(EXIT_FAILURE, "Application must use an even number of ports\n");
+  for(i = 0; i < num_ports; i++){
+    if(proc_type == RTE_PROC_PRIMARY)
+      if (smp_port_init(ports[i], mp, (uint16_t)num_procs) < 0)
+        rte_exit(EXIT_FAILURE, "Error initialising ports\n");
+  }
+
+  // if (proc_type == RTE_PROC_PRIMARY)
+  //   check_all_ports_link_status((uint8_t)num_ports, (~0x0));
+
+  // assign_ports_to_cores();
+  assign_all_ports_to_all_cores();
+
+  // struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS,
+		// 					  MBUF_CACHE_SIZE, 0,
+		// 					  RTE_MBUF_DEFAULT_BUF_SIZE,
+		// 					  rte_socket_id());
+
+  // if(mbuf_pool == NULL)
+  //   rte_exit(EXIT_FAILURE, "Cannot create mbuf pool: are hugepages ok?\n");
+
+  // if(dpdk_port_init(dpdk_port_id, mbuf_pool) != 0)
+  //   rte_exit(EXIT_FAILURE, "DPDK: Cannot init port %u: please see README.dpdk\n", dpdk_port_id);
+
+  // if(!quiet_mode) {
+  //   u_int8_t pid = 10;
+  //   const char* pci_name = "05:00.0";
+  //   if (rte_eth_dev_get_port_by_name(pci_name, &pid) !=0) 
+  //     printf("cannot find %s\n", pci_name);
+  //   printf("%s = %u\n", pci_name, pid);
+  //   printf("Capturing from DPDK (port 0)...\n");
+  // }
 #else
   /* Trying to open the interface */
   if((pcap_handle = pcap_open_live((char*)pcap_file, snaplen,
@@ -2736,11 +2889,7 @@ static pcap_t * openPcapFileOrDevice(u_int16_t thread_id, const u_char * pcap_fi
     live_capture = 1;
 
     if((!quiet_mode)) {
-#ifdef USE_DPDK
-      printf("Capturing from DPDK (port 0)...\n");
-#else
       printf("Capturing live traffic from device %s...\n", pcap_file);
-#endif
     }
   }
 
@@ -2888,6 +3037,84 @@ static void runPcapLoop(u_int16_t thread_id) {
       printf("Error while reading pcap file: '%s'\n", pcap_geterr(ndpi_thread_info[thread_id].workflow->pcap_handle));
 }
 
+
+/* =========modified by Hao Li================== */
+#ifdef USE_DPDK
+static int
+lcore_main(void *arg __rte_unused)
+{
+  const unsigned id = rte_lcore_id();
+  const unsigned start_port = lcore_ports[id].start_port;
+  const unsigned end_port = start_port + lcore_ports[id].num_ports;
+  const uint16_t q_id = (uint16_t)proc_id;
+  unsigned p, i;
+  char msgbuf[256];
+  int msgbufpos = 0;
+
+  if (start_port == end_port){
+    printf("Lcore %u has nothing to do\n", id);
+    return 0;
+  }
+
+  /* build up message in msgbuf before printing to decrease likelihood
+   * of multi-core message interleaving.
+   */
+  msgbufpos += snprintf(msgbuf, sizeof(msgbuf) - msgbufpos,
+      "Lcore %u using ports ", id);
+  for (p = start_port; p < end_port; p++){
+    msgbufpos += snprintf(msgbuf + msgbufpos, sizeof(msgbuf) - msgbufpos,
+        "%u ", (unsigned)ports[p]);
+  }
+  printf("%s\n", msgbuf);
+  printf("lcore %u using queue %u of each port\n", id, (unsigned)q_id);
+
+  /* handle packet I/O from the ports, reading and writing to the
+   * queue number corresponding to our process number (not lcore id)
+   */
+  int thread_id = 0;
+  while (dpdk_run_capture) {
+    struct rte_mbuf *bufs[BURST_SIZE];
+
+    for (p = start_port; p < end_port; p++) {
+      const uint8_t src = ports[p];
+      // const uint8_t dst = ports[p ^ 1]; /* 0 <-> 1, 2 <-> 3 etc */
+      const uint16_t rx_c = rte_eth_rx_burst(src, q_id, bufs, BURST_SIZE);
+      if (rx_c == 0)
+        continue;
+      // pstats[src].rx += rx_c;
+
+      /* handle each of the recieved packets */
+      uint16_t j;
+      for (j = 0 ;j < rx_c; j++) {
+        char *data = rte_pktmbuf_mtod(bufs[j], char *);
+        int len = rte_pktmbuf_pkt_len(bufs[j]);
+        struct pcap_pkthdr h;
+
+        h.len = h.caplen = len;
+        gettimeofday(&h.ts, NULL);
+        ndpi_process_packet((u_char*)&thread_id, &h, (const u_char *)data);
+      }
+
+      for (j = 0 ;j < rx_c; j++) {
+        rte_pktmbuf_free(bufs[j]);
+      }
+
+#if 0
+      const uint16_t tx_c = rte_eth_tx_burst(dst, q_id, buf, rx_c);
+      pstats[dst].tx += tx_c;
+      if (tx_c != rx_c) {
+        pstats[dst].drop += (rx_c - tx_c);
+        for (i = tx_c; i < rx_c; i++)
+          rte_pktmbuf_free(buf[i]);
+      }
+#endif
+    }
+  }
+}
+#endif
+/* =========modified by Hao Li================== */
+
+
 /**
  * @brief Process a running thread
  */
@@ -2984,6 +3211,9 @@ void test_lib() {
   void * thd_res;
 
   /* Running processing threads */
+#ifdef USE_DPDK
+  rte_eal_mp_remote_launch(lcore_main, NULL, CALL_MASTER);
+#else
   for(thread_id = 0; thread_id < num_threads; thread_id++) {
     status = pthread_create(&ndpi_thread_info[thread_id].pthread, NULL, processing_thread, (void *) thread_id);
     /* check pthreade_create return value */
@@ -3005,6 +3235,7 @@ void test_lib() {
       exit(-1);
     }
   }
+#endif
 
   gettimeofday(&end, NULL);
   processing_time_usec = end.tv_sec*1000000 + end.tv_usec - (begin.tv_sec*1000000 + begin.tv_usec);

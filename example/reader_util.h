@@ -44,12 +44,27 @@
 
 #define RX_RING_SIZE     128
 #define TX_RING_SIZE     512
-#define NUM_MBUFS       8191
-#define MBUF_CACHE_SIZE  250
+/* =========modified by Hao Li================== */
+// #define NUM_MBUFS       8191
+// #define MBUF_CACHE_SIZE  250
+#define NUM_MBUFS       64*1024
+#define MBUF_CACHE_SIZE  256
+/* =========modified by Hao Li================== */
 #define BURST_SIZE        32
 #define PREFETCH_OFFSET    3
 
+#define PARAM_PROC_ID "proc-id"
+#define PARAM_NUM_PROCS "num-procs"
+
 extern int dpdk_port_init(int port, struct rte_mempool *mbuf_pool);
+/* =========modified by Hao Li================== */
+struct lcore_ports{
+  unsigned start_port;
+  unsigned num_ports;
+};
+
+extern int smp_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t num_queues);
+/* =========modified by Hao Li================== */
 #endif
 
 /* ETTA Spec defiintions for feature readiness */

@@ -1863,6 +1863,205 @@ u_int32_t ethernet_crc32(const void* data, size_t n_bytes) {
 
 #ifdef USE_DPDK
 
+/* =========modified by Hao Li================== */
+
+#include <rte_common.h>
+#include <rte_log.h>
+#include <rte_memory.h>
+#include <rte_launch.h>
+#include <rte_eal.h>
+#include <rte_per_lcore.h>
+#include <rte_lcore.h>
+#include <rte_atomic.h>
+#include <rte_branch_prediction.h>
+#include <rte_debug.h>
+#include <rte_interrupts.h>
+#include <rte_ether.h>
+#include <rte_ethdev.h>
+#include <rte_mempool.h>
+#include <rte_memcpy.h>
+#include <rte_mbuf.h>
+#include <rte_string_fns.h>
+#include <rte_cycles.h>
+
+static uint8_t seed[40] = {
+  0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+  0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+  0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+  0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A,
+  0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A, 0x6D, 0x5A 
+};
+
+static void 
+set_flow_type_mask(struct rte_eth_hash_filter_info *info, uint32_t ftype)
+{
+    uint32_t idx, offset;
+
+    idx = ftype / (CHAR_BIT * sizeof(uint32_t));
+    offset = ftype % (CHAR_BIT * sizeof(uint32_t));
+    info->info.global_conf.valid_bit_mask[idx] |= (1UL << offset);
+    info->info.global_conf.sym_hash_enable_mask[idx] |= (1UL << offset);
+}
+
+static int
+set_xl710_nic(uint16_t port)
+{
+  int ret = 0;
+  struct rte_eth_hash_filter_info info;
+
+  ret = rte_eth_dev_filter_supported(port, RTE_ETH_FILTER_HASH);
+  if (ret < 0) {
+      printf("RTE_ETH_FILTER_HASH not supported on port: %d\n", port);
+      return ret;
+  }
+
+  memset(&info, 0, sizeof(info));
+  info.info_type = RTE_ETH_HASH_FILTER_GLOBAL_CONFIG;
+  info.info.global_conf.hash_func = RTE_ETH_HASH_FUNCTION_TOEPLITZ;
+
+  set_flow_type_mask(&info, RTE_ETH_FLOW_NONFRAG_IPV4_TCP);
+  set_flow_type_mask(&info, RTE_ETH_FLOW_NONFRAG_IPV4_UDP);
+  set_flow_type_mask(&info, RTE_ETH_FLOW_NONFRAG_IPV4_SCTP);
+  set_flow_type_mask(&info, RTE_ETH_FLOW_NONFRAG_IPV4_OTHER);
+
+  ret = rte_eth_dev_filter_ctrl(port, RTE_ETH_FILTER_HASH, RTE_ETH_FILTER_SET, &info);
+  if (ret < 0) {
+      printf("Cannot set global hash configurations on port %u\n", port);
+      return ret;
+  }
+
+  memset(&info, 0, sizeof(info));
+  info.info_type = RTE_ETH_HASH_FILTER_SYM_HASH_ENA_PER_PORT;
+  info.info.enable = 1;
+  ret = rte_eth_dev_filter_ctrl(port, RTE_ETH_FILTER_HASH, 
+                                RTE_ETH_FILTER_SET, &info);
+
+  if (ret < 0) {
+      printf("Cannot set symmetric hash enable per port on port %u\n", port);
+      return ret;
+  }
+  
+  return 0;
+}
+
+/*
+ * Initialises a given port using global settings and with the rx buffers
+ * coming from the mbuf_pool passed as parameter
+ */
+int
+smp_port_init(uint16_t port, struct rte_mempool *mbuf_pool, uint16_t num_queues)
+{
+  struct rte_eth_conf port_conf = {
+      .rxmode = {
+        .mq_mode  = ETH_MQ_RX_RSS,
+        .split_hdr_size = 0,
+// #if (RTE_VERSION > RTE_VERSION_NUM(18, 6, 0, 0))
+        // .offloads = (DEV_RX_OFFLOAD_CHECKSUM |
+               // DEV_RX_OFFLOAD_CRC_STRIP),
+// #endif
+// #if (RTE_VERSION < RTE_VERSION_NUM(19, 8, 0, 0))
+        .max_rx_pkt_len = ETHER_MAX_LEN
+// #else
+        // .max_rx_pkt_len = RTE_ETHER_MAX_LEN
+// #endif
+      },
+      .rx_adv_conf = {
+        .rss_conf = {
+          .rss_key = seed,
+          .rss_key_len = sizeof(seed),
+#ifdef XL710
+          .rss_hf = ETH_RSS_NONFRAG_IPV4_TCP | ETH_RSS_NONFRAG_IPV4_UDP |
+                    ETH_RSS_NONFRAG_IPV4_SCTP,
+#else
+          .rss_hf = ETH_RSS_TCP | ETH_RSS_UDP | ETH_RSS_IP | ETH_RSS_SCTP,
+#endif
+        },
+      },
+      .txmode = {
+        .mq_mode = ETH_MQ_TX_NONE,
+      }
+  };
+  const uint16_t rx_rings = num_queues, tx_rings = num_queues;
+  struct rte_eth_dev_info info;
+  struct rte_eth_rxconf rxq_conf;
+  struct rte_eth_txconf txq_conf;
+  int retval;
+  uint16_t q;
+  uint16_t nb_rxd = RX_RING_SIZE;
+  uint16_t nb_txd = TX_RING_SIZE;
+  uint64_t rss_hf_tmp;
+
+  if (rte_eal_process_type() == RTE_PROC_SECONDARY)
+    return 0;
+
+  if (!rte_eth_dev_is_valid_port(port))
+    return -1;
+
+  printf("# Initialising port %u... ", port);
+  fflush(stdout);
+
+  rte_eth_dev_info_get(port, &info);
+  info.default_rxconf.rx_drop_en = 1;
+
+  // if (info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE)
+    // port_conf.txmode.offloads |=
+      // DEV_TX_OFFLOAD_MBUF_FAST_FREE;
+
+  rss_hf_tmp = port_conf.rx_adv_conf.rss_conf.rss_hf;
+  port_conf.rx_adv_conf.rss_conf.rss_hf &= info.flow_type_rss_offloads;
+  if (port_conf.rx_adv_conf.rss_conf.rss_hf != rss_hf_tmp) {
+    printf("Port %u modified RSS hash function based on hardware support,"
+      "requested:%#"PRIx64" configured:%#"PRIx64"\n",
+      port,
+      rss_hf_tmp,
+      port_conf.rx_adv_conf.rss_conf.rss_hf);
+  }
+
+
+  retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
+  if (retval < 0)
+    return retval;
+
+  retval = set_xl710_nic(port);
+  if (retval < 0)
+    return retval;
+
+  retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
+  if (retval < 0)
+    return retval;
+
+  rxq_conf = info.default_rxconf;
+  // rxq_conf.offloads = port_conf.rxmode.offloads;
+  for (q = 0; q < rx_rings; q ++) {
+    retval = rte_eth_rx_queue_setup(port, q, nb_rxd,
+        rte_eth_dev_socket_id(port),
+        &rxq_conf,
+        mbuf_pool);
+    if (retval < 0)
+      return retval;
+  }
+
+  txq_conf = info.default_txconf;
+  // txq_conf.offloads = port_conf.txmode.offloads;
+  for (q = 0; q < tx_rings; q ++) {
+    retval = rte_eth_tx_queue_setup(port, q, nb_txd,
+        rte_eth_dev_socket_id(port),
+        &txq_conf);
+    if (retval < 0)
+      return retval;
+  }
+
+  rte_eth_promiscuous_enable(port);
+
+  retval  = rte_eth_dev_start(port);
+  if (retval < 0)
+    return retval;
+
+  return 0;
+}
+
+/* =========modified by Hao Li================== */
+
 #include <rte_version.h>
 #include <rte_ether.h>
 
